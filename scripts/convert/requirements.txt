@@ -1,0 +1,9 @@
+# モデル変換 (scripts/convert/) の依存。上流 litagin02/style-bert-vits2 と HF transformers のみ。
+numpy<2
+style-bert-vits2
+torch
+onnx
+onnxsim
+onnxruntime
+transformers
+sentencepiece

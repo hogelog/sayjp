@@ -1,0 +1,9 @@
+sayjp — オフライン日本語 TTS CLI
+=================================
+
+本体は AGPL-3.0-or-later (LICENSE)。litagin02/Style-Bert-VITS2 を参照した派生実装です。
+
+src/engine/ は neodyland/sbv2-api の sbv2_core (MIT, © 2024 tuna2134 / © 2025- neodyland)
+を移植・改変したもの。sbv2_core 自体が litagin02/Style-Bert-VITS2 (AGPL-3.0、g2p は
+LGPL-3.0) の Rust 移植で、各処理が対応する SBV2 原典は個別ファイル先頭に記載。
+全文: licenses/sbv2-api-MIT.txt / licenses/Style-Bert-VITS2-g2p-LGPL-3.0.txt

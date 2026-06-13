@@ -1,0 +1,13 @@
+# 作業中の出力
+out.wav
+*.wav
+
+# ビルド作業ディレクトリ・生成モデル (mise task で再生成)
+/.build/
+/models/
+
+# Rust
+/target/
+
+# macOS
+.DS_Store

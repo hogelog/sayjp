@@ -1,0 +1,49 @@
+[tools]
+uv = "latest"
+python = "3.11"
+
+[tasks.build]
+description = "バイナリをビルド"
+run = "cargo build --release"
+
+[tasks.pyenv]
+description = "変換用 Python 環境を用意"
+run = '''
+set -euo pipefail
+uv venv .build/.venv
+VIRTUAL_ENV=.build/.venv uv pip install "numpy<2" "style-bert-vits2" torch \
+  onnx onnxsim onnxruntime transformers sentencepiece
+'''
+
+[tasks.convert-voice]
+description = "Style-Bert-VITS2 形式の音声モデルを voice.onnx + style_vectors.json へ変換"
+depends = ["pyenv"]
+run = '''
+set -euo pipefail
+: "${MODEL_FILE:?SBV2 の .safetensors を MODEL_FILE で指定}"
+: "${CONFIG_FILE:?config.json を CONFIG_FILE で指定}"
+: "${STYLE_FILE:?style_vectors.npy を STYLE_FILE で指定}"
+mkdir -p models
+.build/.venv/bin/python scripts/convert/convert_model.py \
+  --model_file  "$MODEL_FILE" \
+  --config_file "$CONFIG_FILE" \
+  --style_file  "$STYLE_FILE" \
+  --out_dir models
+'''
+
+[tasks.convert-deberta]
+description = "deberta.onnx + tokenizer.json を生成"
+depends = ["pyenv"]
+run = '''
+set -euo pipefail
+mkdir -p models
+.build/.venv/bin/python scripts/convert/convert_deberta.py --out_dir models
+'''
+
+[tasks.models]
+description = "モデル一式を生成 (convert-voice は MODEL_FILE 等の指定が必要)"
+depends = ["convert-deberta", "convert-voice"]
+
+[tasks.clean]
+description = "生成物を削除"
+run = "rm -rf .build target models *.wav"
