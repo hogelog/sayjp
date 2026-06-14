@@ -75,17 +75,21 @@ pub fn parse_text(
 }
 
 pub fn array_to_vec(audio_array: Array3<f32>) -> Result<Vec<u8>> {
+    // 16bit PCM 固定。32bit float は hound が WAVEFORMATEXTENSIBLE で書き、モノラルでも
+    // チャンネルマスクが FRONT_LEFT (0x1) になるため CoreAudio 系で左耳のみ再生になる
+    // (hound にマスク指定 API は無い)。PCM 形式タグ 1 にはマスク欄が無く両耳で鳴る。
     let spec = WavSpec {
         channels: 1,
         sample_rate: 44100,
-        bits_per_sample: 32,
-        sample_format: SampleFormat::Float,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
     };
     let mut cursor = Cursor::new(Vec::new());
     let mut writer = WavWriter::new(&mut cursor, spec)?;
     for i in 0..audio_array.shape()[0] {
         for sample in audio_array.slice(s![i, 0, ..]).to_vec() {
-            writer.write_sample(sample)?;
+            let v = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+            writer.write_sample(v)?;
         }
     }
     writer.finalize()?;

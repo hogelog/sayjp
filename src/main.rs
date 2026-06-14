@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context, Result};
 mod engine;
 use engine::tts::{SynthesizeOptions, TTSModelHolder};
 
-/// 再生時の頭切れ対策。エンジンは 32bit float/mono 出力なので float 経路が主。
+/// 再生時の頭切れ対策。出力は 16bit PCM/mono なので Int 経路が主。
 fn prepend_silence(wav: &[u8], secs: f32) -> Result<Vec<u8>> {
     let spec = hound::WavReader::new(Cursor::new(wav))
         .context("wav 解析失敗")?
