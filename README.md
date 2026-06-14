@@ -24,9 +24,9 @@ MODEL_FILE=voice.safetensors CONFIG_FILE=config.json STYLE_FILE=style_vectors.np
 ## 使い方
 
 ```
-sayjp "こんにちは、テストです"        # out.wav を生成
-sayjp -o greeting.wav "おはよう"      # 出力先を指定
-sayjp --play "再生もします"           # 生成後に再生 (wav は残さない)
+sayjp "こんにちは、テストです"        # 生成後に再生 (wav は残さない)
+sayjp -o greeting.wav "おはよう"      # 再生しつつ出力先にも残す
+sayjp --no-play -o out.wav "保存だけ" # 再生せず wav 出力のみ
 ```
 
 ```
@@ -37,7 +37,7 @@ sayjp [OPTIONS] "読み上げるテキスト"
   --sdp N          抑揚(リズム)の強さ 0.0〜1.0 (大きいほど豊か。既定: 0.3)
   --style-weight N スタイルの強さ (小さいほど無感情・落ち着く。既定: 1.0)
   --model-dir DIR  モデルディレクトリ (既定: 実行ファイル隣の models/)
-  --play           再生のみ (wav を残さない。-o 併用時はファイルも残す)
+  --no-play        再生せず wav 出力のみ (既定は生成後に再生)
   -h, --help       ヘルプ
 ```
 

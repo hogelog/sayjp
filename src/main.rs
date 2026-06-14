@@ -55,7 +55,7 @@ OPTIONS:
     --sdp N          抑揚(リズム)の強さ 0.0〜1.0 (大きいほど豊か。既定: 0.3)
     --style-weight N スタイルの強さ (小さいほど無感情・落ち着く。既定: 1.0)
     --model-dir DIR  モデルディレクトリ (既定: 実行ファイル隣の models/)
-    --play           再生のみ (wav を残さない。-o 指定時はファイルも残す)
+    --no-play        再生せず wav 出力のみ (既定は生成後に再生)
     -h, --help       このヘルプ
 "#;
 
@@ -78,7 +78,7 @@ fn parse_args() -> Result<Option<Args>> {
     let mut speed = 1.0f32;
     let mut sdp = 0.3f32;
     let mut style_weight = 1.0f32;
-    let mut play = false;
+    let mut play = true;
     let mut model_dir: Option<PathBuf> = None;
     let mut text: Option<String> = None;
 
@@ -123,7 +123,7 @@ fn parse_args() -> Result<Option<Args>> {
                     it.next().ok_or_else(|| anyhow!("--model-dir はディレクトリが必要です"))?,
                 ))
             }
-            "--play" => play = true,
+            "--no-play" => play = false,
             s if s.starts_with('-') && s.len() > 1 => return Err(anyhow!("不明なオプション: {s}")),
             s => text = Some(s.to_string()),
         }
