@@ -197,6 +197,30 @@ fn run() -> Result<()> {
         Some(a) => a,
     };
 
+    // デバッグ: g2p (音素列/アクセント tone 列) だけを JSON で出力して終了 (モデル不要)。
+    if env::var("SAYJP_DUMP_G2P").is_ok() {
+        let jtalk = engine::jtalk::JTalk::new().map_err(|e| anyhow!("jtalk 初期化失敗: {e}"))?;
+        let text = jtalk
+            .num2word(&args.text)
+            .map_err(|e| anyhow!("num2word 失敗: {e}"))?;
+        let normalized = engine::norm::normalize_text(&text);
+        let process = jtalk
+            .process_text(&normalized)
+            .map_err(|e| anyhow!("process_text 失敗: {e}"))?;
+        let (phones, tones, word2ph) = process.g2p().map_err(|e| anyhow!("g2p 失敗: {e}"))?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "text": args.text,
+                "normalized": normalized,
+                "phones": phones,
+                "tones": tones,
+                "word2ph": word2ph,
+            })
+        );
+        return Ok(());
+    }
+
     let dir = model_dir(args.model_dir.clone())?;
     if !dir.is_dir() {
         return Err(anyhow!(
