@@ -16,8 +16,6 @@ path = "src/main.rs"
 anyhow = "1"
 hound = "3.5"
 ndarray = "0.17.1"
-# default features に download-binaries(静的 onnxruntime) と ndarray を含む。
-ort = { git = "https://github.com/pykeio/ort.git", rev = "2de34065983a5c034f5afcc072b23b99479f465b" }
 jpreprocess = { version = "0.13.2", features = ["naist-jdic"] }
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig", "esaxx_fast"] }
 serde = { version = "1", features = ["derive"] }
@@ -26,6 +24,16 @@ regex = "1"
 once_cell = "1"
 num_cpus = "1"
 thiserror = "2"
+
+# onnxruntime のリンク方式はターゲットで分ける。
+# desktop: default features の download-binaries で静的リンク (単体バイナリで完結)。
+# android: 静的ビルドが配布されないため load-dynamic にし、実行時に libonnxruntime.so を
+#          dlopen する (ORT_DYLIB_PATH で同梱 .so を指す)。
+[target.'cfg(not(target_os = "android"))'.dependencies]
+ort = { git = "https://github.com/pykeio/ort.git", rev = "2de34065983a5c034f5afcc072b23b99479f465b" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ort = { git = "https://github.com/pykeio/ort.git", rev = "2de34065983a5c034f5afcc072b23b99479f465b", default-features = false, features = ["ndarray", "load-dynamic"] }
 
 [profile.release]
 strip = true
