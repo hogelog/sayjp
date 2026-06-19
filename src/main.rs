@@ -56,6 +56,10 @@ OPTIONS:
     --style-weight N スタイルの強さ (小さいほど無感情・落ち着く。既定: 1.0)
     --model-dir DIR  モデルディレクトリ (既定: 実行ファイル隣の models/)
     --no-play        再生せず wav 出力のみ (既定は生成後に再生)
+    --serve          常駐モード。モデルを 1 回ロードし、stdin から 1 行
+                     "<出力wavパス>\t<テキスト>" を受けるたびに合成して wav を書き、
+                     "OK <パス>" / "ERR <理由>" を stdout に返す (EOF で終了)。
+                     プロセスを使い回すことで 2 回目以降をウォーム実行する用途。
     -h, --help       このヘルプ
 "#;
 
@@ -69,6 +73,7 @@ struct Args {
     style_weight: f32,
     play: bool,
     model_dir: Option<PathBuf>,
+    serve: bool,
 }
 
 fn parse_args() -> Result<Option<Args>> {
@@ -80,6 +85,7 @@ fn parse_args() -> Result<Option<Args>> {
     let mut style_weight = 1.0f32;
     let mut play = true;
     let mut model_dir: Option<PathBuf> = None;
+    let mut serve = false;
     let mut text: Option<String> = None;
 
     let mut it = env::args().skip(1);
@@ -124,15 +130,22 @@ fn parse_args() -> Result<Option<Args>> {
                 ))
             }
             "--no-play" => play = false,
+            "--serve" => serve = true,
             s if s.starts_with('-') && s.len() > 1 => return Err(anyhow!("不明なオプション: {s}")),
             s => text = Some(s.to_string()),
         }
     }
 
-    let text = text.ok_or_else(|| anyhow!("読み上げるテキストを指定してください (-h でヘルプ)"))?;
-    if text.trim().is_empty() {
-        return Err(anyhow!("テキストが空です"));
-    }
+    // serve モードは stdin から1リクエストずつ読むので、起動引数のテキストは不要。
+    let text = if serve {
+        text.unwrap_or_default()
+    } else {
+        let t = text.ok_or_else(|| anyhow!("読み上げるテキストを指定してください (-h でヘルプ)"))?;
+        if t.trim().is_empty() {
+            return Err(anyhow!("テキストが空です"));
+        }
+        t
+    };
     if speed <= 0.0 {
         return Err(anyhow!("--speed は正の数を指定してください"));
     }
@@ -149,6 +162,7 @@ fn parse_args() -> Result<Option<Args>> {
         style_weight,
         play,
         model_dir,
+        serve,
     }))
 }
 
@@ -222,45 +236,13 @@ fn run() -> Result<()> {
     }
 
     let dir = model_dir(args.model_dir.clone())?;
-    if !dir.is_dir() {
-        return Err(anyhow!(
-            "モデルディレクトリが見つかりません: {}\n--model-dir か SAYJP_MODEL_DIR で指定するか、models/ を実行ファイルと同階層に配置してください。",
-            dir.display()
-        ));
+    let mut holder = load_models(&dir)?;
+
+    if args.serve {
+        return serve(&mut holder, &args);
     }
-    let bert = dir.join("deberta.onnx");
-    let tokenizer = dir.join("tokenizer.json");
-    let voice = dir.join("voice.onnx");
-    let style = dir.join("style_vectors.json");
 
-    let mut holder = TTSModelHolder::new(
-        &fs::read(&bert).with_context(|| format!("読み込み失敗: {}", bert.display()))?,
-        &fs::read(&tokenizer).with_context(|| format!("読み込み失敗: {}", tokenizer.display()))?,
-    )
-    .map_err(|e| anyhow!("モデルの初期化に失敗しました: {e}"))?;
-
-    let ident = "voice";
-    holder
-        .load(
-            ident,
-            fs::read(&voice).with_context(|| format!("読み込み失敗: {}", voice.display()))?,
-            fs::read(&style).with_context(|| format!("読み込み失敗: {}", style.display()))?,
-        )
-        .map_err(|e| anyhow!("音声モデルの読み込みに失敗 ({}): {e}", voice.display()))?;
-
-    let opts = SynthesizeOptions {
-        length_scale: 1.0 / args.speed,
-        sdp_ratio: args.sdp,
-        style_weight: args.style_weight,
-        ..Default::default()
-    };
-
-    let audio = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        holder.easy_synthesize(ident, &args.text, args.style_id, 0, opts)
-    }))
-    .map_err(|_| anyhow!("テキストを解析できませんでした (記号や特殊な文字だけの入力などが原因の可能性があります)"))?
-    .map_err(|e| anyhow!("音声合成に失敗しました (テキストやスタイル ID を確認してください): {e}"))?;
-    let audio = prepend_silence(&audio, 0.5).unwrap_or(audio);
+    let audio = synth_one(&mut holder, &args.text, &args)?;
 
     let keep = args.out_explicit || !args.play;
     let target = if keep {
@@ -279,6 +261,85 @@ fn run() -> Result<()> {
         if !keep {
             let _ = fs::remove_file(&target);
         }
+    }
+    Ok(())
+}
+
+const IDENT: &str = "voice";
+
+/// モデルディレクトリから BERT + 音声モデルを読み込む (重い処理。serve では 1 回だけ)。
+fn load_models(dir: &Path) -> Result<TTSModelHolder> {
+    if !dir.is_dir() {
+        return Err(anyhow!(
+            "モデルディレクトリが見つかりません: {}\n--model-dir か SAYJP_MODEL_DIR で指定するか、models/ を実行ファイルと同階層に配置してください。",
+            dir.display()
+        ));
+    }
+    let bert = dir.join("deberta.onnx");
+    let tokenizer = dir.join("tokenizer.json");
+    let voice = dir.join("voice.onnx");
+    let style = dir.join("style_vectors.json");
+
+    let mut holder = TTSModelHolder::new(
+        &fs::read(&bert).with_context(|| format!("読み込み失敗: {}", bert.display()))?,
+        &fs::read(&tokenizer).with_context(|| format!("読み込み失敗: {}", tokenizer.display()))?,
+    )
+    .map_err(|e| anyhow!("モデルの初期化に失敗しました: {e}"))?;
+    holder
+        .load(
+            IDENT,
+            fs::read(&voice).with_context(|| format!("読み込み失敗: {}", voice.display()))?,
+            fs::read(&style).with_context(|| format!("読み込み失敗: {}", style.display()))?,
+        )
+        .map_err(|e| anyhow!("音声モデルの読み込みに失敗 ({}): {e}", voice.display()))?;
+    Ok(holder)
+}
+
+/// 1 文を合成して wav バイト列を返す (頭の無音付き)。run/serve 共通。
+fn synth_one(holder: &mut TTSModelHolder, text: &str, args: &Args) -> Result<Vec<u8>> {
+    let opts = SynthesizeOptions {
+        length_scale: 1.0 / args.speed,
+        sdp_ratio: args.sdp,
+        style_weight: args.style_weight,
+        ..Default::default()
+    };
+    let audio = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        holder.easy_synthesize(IDENT, text, args.style_id, 0, opts)
+    }))
+    .map_err(|_| anyhow!("テキストを解析できませんでした (記号や特殊な文字だけの入力などが原因の可能性があります)"))?
+    .map_err(|e| anyhow!("音声合成に失敗しました (テキストやスタイル ID を確認してください): {e}"))?;
+    Ok(prepend_silence(&audio, 0.5).unwrap_or(audio))
+}
+
+/// 常駐モード。モデルを保持したまま stdin から 1 行 = 1 リクエストを処理し続ける。
+/// 入力: "<出力wavパス>\t<テキスト>"  出力: "OK <パス>" または "ERR <理由>"。
+/// 1 件の失敗ではループを抜けず次のリクエストを待つ (プロセスを温存する)。
+fn serve(holder: &mut TTSModelHolder, args: &Args) -> Result<()> {
+    use std::io::{BufRead, Write};
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for line in stdin.lock().lines() {
+        let line = line.context("stdin の読み取りに失敗")?;
+        if line.is_empty() {
+            continue;
+        }
+        let (path, text) = match line.split_once('\t') {
+            Some(pt) => pt,
+            None => {
+                writeln!(out, "ERR リクエストは \"<出力wavパス>\\t<テキスト>\" 形式です")?;
+                out.flush()?;
+                continue;
+            }
+        };
+        match synth_one(holder, text, args) {
+            Ok(audio) => match fs::write(path, &audio) {
+                Ok(()) => writeln!(out, "OK {path}")?,
+                Err(e) => writeln!(out, "ERR 書き込み失敗 {path}: {e}")?,
+            },
+            Err(e) => writeln!(out, "ERR {e:#}")?,
+        }
+        out.flush()?;
     }
     Ok(())
 }
