@@ -56,8 +56,23 @@ OPTIONS:
     --style-weight N スタイルの強さ (小さいほど無感情・落ち着く。既定: 1.0)
     --model-dir DIR  モデルディレクトリ (既定: 実行ファイル隣の models/)
     --no-play        再生せず wav 出力のみ (既定は生成後に再生)
+    --serve          常駐モード。起動時にするのはモデルロードだけ (--model-dir /
+                     SAYJP_MODEL_DIR のみ参照)。あとは stdin から 1 行 = 1 リクエストの
+                     JSON を受けるたびに、元の CLI 1 回分と同じ処理 (wav を out へ書き、
+                     必要なら再生) をウォームで実行し、結果 JSON を stdout に 1 行返す
+                     (EOF で終了)。合成パラメータはすべてリクエストで渡す。
+                     リクエスト: {"text":必須, "out"?, "play"?, "style_id"?, "speed"?,
+                       "sdp"?, "style_weight"?}  (text 以外は省略時 one-shot と同じ既定値)
+                     応答: {"status":"ok","path":"<書いた wav>"} / {"status":"error","error":...}
     -h, --help       このヘルプ
 "#;
+
+// 合成パラメータの既定値。one-shot の引数省略時と serve のリクエスト省略時で共有する。
+const DEFAULT_STYLE_ID: i32 = 0;
+const DEFAULT_SPEED: f32 = 1.0;
+const DEFAULT_SDP: f32 = 0.3;
+const DEFAULT_STYLE_WEIGHT: f32 = 1.0;
+const DEFAULT_OUT: &str = "out.wav";
 
 struct Args {
     text: String,
@@ -69,17 +84,19 @@ struct Args {
     style_weight: f32,
     play: bool,
     model_dir: Option<PathBuf>,
+    serve: bool,
 }
 
 fn parse_args() -> Result<Option<Args>> {
-    let mut out = PathBuf::from("out.wav");
+    let mut out = PathBuf::from(DEFAULT_OUT);
     let mut out_explicit = false;
-    let mut style_id = 0i32;
-    let mut speed = 1.0f32;
-    let mut sdp = 0.3f32;
-    let mut style_weight = 1.0f32;
+    let mut style_id = DEFAULT_STYLE_ID;
+    let mut speed = DEFAULT_SPEED;
+    let mut sdp = DEFAULT_SDP;
+    let mut style_weight = DEFAULT_STYLE_WEIGHT;
     let mut play = true;
     let mut model_dir: Option<PathBuf> = None;
+    let mut serve = false;
     let mut text: Option<String> = None;
 
     let mut it = env::args().skip(1);
@@ -124,15 +141,22 @@ fn parse_args() -> Result<Option<Args>> {
                 ))
             }
             "--no-play" => play = false,
+            "--serve" => serve = true,
             s if s.starts_with('-') && s.len() > 1 => return Err(anyhow!("不明なオプション: {s}")),
             s => text = Some(s.to_string()),
         }
     }
 
-    let text = text.ok_or_else(|| anyhow!("読み上げるテキストを指定してください (-h でヘルプ)"))?;
-    if text.trim().is_empty() {
-        return Err(anyhow!("テキストが空です"));
-    }
+    // serve モードは stdin から1リクエストずつ読むので、起動引数のテキストは不要。
+    let text = if serve {
+        text.unwrap_or_default()
+    } else {
+        let t = text.ok_or_else(|| anyhow!("読み上げるテキストを指定してください (-h でヘルプ)"))?;
+        if t.trim().is_empty() {
+            return Err(anyhow!("テキストが空です"));
+        }
+        t
+    };
     if speed <= 0.0 {
         return Err(anyhow!("--speed は正の数を指定してください"));
     }
@@ -149,6 +173,7 @@ fn parse_args() -> Result<Option<Args>> {
         style_weight,
         play,
         model_dir,
+        serve,
     }))
 }
 
@@ -222,45 +247,20 @@ fn run() -> Result<()> {
     }
 
     let dir = model_dir(args.model_dir.clone())?;
-    if !dir.is_dir() {
-        return Err(anyhow!(
-            "モデルディレクトリが見つかりません: {}\n--model-dir か SAYJP_MODEL_DIR で指定するか、models/ を実行ファイルと同階層に配置してください。",
-            dir.display()
-        ));
+    let mut holder = load_models(&dir)?;
+
+    if args.serve {
+        return serve(&mut holder);
     }
-    let bert = dir.join("deberta.onnx");
-    let tokenizer = dir.join("tokenizer.json");
-    let voice = dir.join("voice.onnx");
-    let style = dir.join("style_vectors.json");
 
-    let mut holder = TTSModelHolder::new(
-        &fs::read(&bert).with_context(|| format!("読み込み失敗: {}", bert.display()))?,
-        &fs::read(&tokenizer).with_context(|| format!("読み込み失敗: {}", tokenizer.display()))?,
-    )
-    .map_err(|e| anyhow!("モデルの初期化に失敗しました: {e}"))?;
-
-    let ident = "voice";
-    holder
-        .load(
-            ident,
-            fs::read(&voice).with_context(|| format!("読み込み失敗: {}", voice.display()))?,
-            fs::read(&style).with_context(|| format!("読み込み失敗: {}", style.display()))?,
-        )
-        .map_err(|e| anyhow!("音声モデルの読み込みに失敗 ({}): {e}", voice.display()))?;
-
-    let opts = SynthesizeOptions {
-        length_scale: 1.0 / args.speed,
-        sdp_ratio: args.sdp,
-        style_weight: args.style_weight,
-        ..Default::default()
-    };
-
-    let audio = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        holder.easy_synthesize(ident, &args.text, args.style_id, 0, opts)
-    }))
-    .map_err(|_| anyhow!("テキストを解析できませんでした (記号や特殊な文字だけの入力などが原因の可能性があります)"))?
-    .map_err(|e| anyhow!("音声合成に失敗しました (テキストやスタイル ID を確認してください): {e}"))?;
-    let audio = prepend_silence(&audio, 0.5).unwrap_or(audio);
+    let audio = synth_one(
+        &mut holder,
+        &args.text,
+        args.style_id,
+        args.speed,
+        args.sdp,
+        args.style_weight,
+    )?;
 
     let keep = args.out_explicit || !args.play;
     let target = if keep {
@@ -281,4 +281,128 @@ fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+const IDENT: &str = "voice";
+
+/// モデルディレクトリから BERT + 音声モデルを読み込む (重い処理。serve では 1 回だけ)。
+fn load_models(dir: &Path) -> Result<TTSModelHolder> {
+    if !dir.is_dir() {
+        return Err(anyhow!(
+            "モデルディレクトリが見つかりません: {}\n--model-dir か SAYJP_MODEL_DIR で指定するか、models/ を実行ファイルと同階層に配置してください。",
+            dir.display()
+        ));
+    }
+    let bert = dir.join("deberta.onnx");
+    let tokenizer = dir.join("tokenizer.json");
+    let voice = dir.join("voice.onnx");
+    let style = dir.join("style_vectors.json");
+
+    let mut holder = TTSModelHolder::new(
+        &fs::read(&bert).with_context(|| format!("読み込み失敗: {}", bert.display()))?,
+        &fs::read(&tokenizer).with_context(|| format!("読み込み失敗: {}", tokenizer.display()))?,
+    )
+    .map_err(|e| anyhow!("モデルの初期化に失敗しました: {e}"))?;
+    holder
+        .load(
+            IDENT,
+            fs::read(&voice).with_context(|| format!("読み込み失敗: {}", voice.display()))?,
+            fs::read(&style).with_context(|| format!("読み込み失敗: {}", style.display()))?,
+        )
+        .map_err(|e| anyhow!("音声モデルの読み込みに失敗 ({}): {e}", voice.display()))?;
+    Ok(holder)
+}
+
+/// 1 文を合成して wav バイト列を返す (頭の無音付き)。run/serve 共通。
+fn synth_one(
+    holder: &mut TTSModelHolder,
+    text: &str,
+    style_id: i32,
+    speed: f32,
+    sdp: f32,
+    style_weight: f32,
+) -> Result<Vec<u8>> {
+    let opts = SynthesizeOptions {
+        length_scale: 1.0 / speed,
+        sdp_ratio: sdp,
+        style_weight,
+        ..Default::default()
+    };
+    let audio = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        holder.easy_synthesize(IDENT, text, style_id, 0, opts)
+    }))
+    .map_err(|_| anyhow!("テキストを解析できませんでした (記号や特殊な文字だけの入力などが原因の可能性があります)"))?
+    .map_err(|e| anyhow!("音声合成に失敗しました (テキストやスタイル ID を確認してください): {e}"))?;
+    Ok(prepend_silence(&audio, 0.5).unwrap_or(audio))
+}
+
+/// serve の 1 リクエスト。起動時は --model-dir でモデルを読むだけで、合成パラメータは
+/// すべてここで渡す (起動フラグからは取らない)。text 以外は省略時に CLI と同じ既定値。
+#[derive(serde::Deserialize)]
+struct ServeRequest {
+    /// 読み上げるテキスト (JSON 文字列なので改行を含んでも 1 行で渡せる)。
+    text: String,
+    /// 出力 wav のパス (-o 相当)。省略時は out.wav。
+    #[serde(default)]
+    out: Option<String>,
+    /// 生成後に再生するか。省略時は再生する。
+    #[serde(default)]
+    play: Option<bool>,
+    #[serde(default)]
+    style_id: Option<i32>,
+    #[serde(default)]
+    speed: Option<f32>,
+    #[serde(default)]
+    sdp: Option<f32>,
+    #[serde(default)]
+    style_weight: Option<f32>,
+}
+
+/// 常駐モード。起動時にしたのはモデルロードだけ。あとは stdin から 1 行 = 1 リクエストの
+/// JSON を受け、合成に必要なパラメータはすべてリクエストから取る (起動フラグは見ない)。
+/// 入力: {"text":..., "out"?:..., "play"?:..., "style_id"?:..., "speed"?:..., "sdp"?:..., "style_weight"?:...}
+/// 出力: {"status":"ok","path":"<書いた wav>"} または {"status":"error","error":"<理由>"}
+/// 1 件の失敗ではループを抜けない (EOF で終了)。
+fn serve(holder: &mut TTSModelHolder) -> Result<()> {
+    use std::io::{BufRead, Write};
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for line in stdin.lock().lines() {
+        let line = line.context("stdin の読み取りに失敗")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let resp = match serde_json::from_str::<ServeRequest>(&line) {
+            Ok(req) => serve_one(holder, &req),
+            Err(e) => serde_json::json!({ "status": "error", "error": format!("不正なリクエスト JSON: {e}") }),
+        };
+        writeln!(out, "{resp}")?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
+/// 1 リクエストを処理: 合成 → out のパスへ書き出し → 必要なら再生。結果 JSON を返す。
+/// 省略パラメータは CLI と同じ既定値を使う。
+fn serve_one(holder: &mut TTSModelHolder, req: &ServeRequest) -> serde_json::Value {
+    let audio = match synth_one(
+        holder,
+        &req.text,
+        req.style_id.unwrap_or(DEFAULT_STYLE_ID),
+        req.speed.unwrap_or(DEFAULT_SPEED),
+        req.sdp.unwrap_or(DEFAULT_SDP),
+        req.style_weight.unwrap_or(DEFAULT_STYLE_WEIGHT),
+    ) {
+        Ok(a) => a,
+        Err(e) => return serde_json::json!({ "status": "error", "error": format!("{e:#}") }),
+    };
+    let path = req.out.clone().unwrap_or_else(|| DEFAULT_OUT.to_string());
+    if let Err(e) = fs::write(&path, &audio) {
+        return serde_json::json!({ "status": "error", "error": format!("書き込み失敗 {path}: {e}") });
+    }
+    if req.play.unwrap_or(true) {
+        play(Path::new(&path));
+    }
+    serde_json::json!({ "status": "ok", "path": path })
 }
