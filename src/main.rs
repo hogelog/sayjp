@@ -56,10 +56,12 @@ OPTIONS:
     --style-weight N スタイルの強さ (小さいほど無感情・落ち着く。既定: 1.0)
     --model-dir DIR  モデルディレクトリ (既定: 実行ファイル隣の models/)
     --no-play        再生せず wav 出力のみ (既定は生成後に再生)
-    --serve          常駐モード。モデルを 1 回ロードし、stdin から 1 行
-                     "<出力wavパス>\t<テキスト>" を受けるたびに合成して wav を書き、
-                     "OK <パス>" / "ERR <理由>" を stdout に返す (EOF で終了)。
-                     プロセスを使い回すことで 2 回目以降をウォーム実行する用途。
+    --serve          常駐モード。モデルを 1 回ロードし、stdin から 1 行 = 1 リクエストの
+                     JSON {"text":"<テキスト>"} を受けるたびに合成し、結果 JSON
+                     {"ok":true,"wav_base64":"<base64 の wav>"} か
+                     {"ok":false,"error":...} を stdout に 1 行返す (EOF で終了)。
+                     ファイルを介さずパイプで完結。プロセスを使い回すことで 2 回目
+                     以降をウォーム実行する用途。
     -h, --help       このヘルプ
 "#;
 
@@ -311,34 +313,39 @@ fn synth_one(holder: &mut TTSModelHolder, text: &str, args: &Args) -> Result<Vec
     Ok(prepend_silence(&audio, 0.5).unwrap_or(audio))
 }
 
-/// 常駐モード。モデルを保持したまま stdin から 1 行 = 1 リクエストを処理し続ける。
-/// 入力: "<出力wavパス>\t<テキスト>"  出力: "OK <パス>" または "ERR <理由>"。
-/// 1 件の失敗ではループを抜けず次のリクエストを待つ (プロセスを温存する)。
+#[derive(serde::Deserialize)]
+struct ServeRequest {
+    /// 読み上げるテキスト (JSON 文字列なので改行を含んでも 1 行で渡せる)。
+    text: String,
+}
+
+/// 常駐モード。モデルを保持したまま stdin から 1 行 = 1 リクエストの JSON を処理し続ける。
+/// 入出力ともファイルを介さず JSON で完結する。
+/// 入力: {"text":"<テキスト>"}
+/// 出力: {"ok":true,"wav_base64":"<base64 の wav>"} または {"ok":false,"error":"<理由>"}
+/// テキストの改行は JSON エスケープで 1 行に収まる。1 件の失敗ではループを抜けない (EOF で終了)。
 fn serve(holder: &mut TTSModelHolder, args: &Args) -> Result<()> {
+    use base64::Engine;
     use std::io::{BufRead, Write};
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     for line in stdin.lock().lines() {
         let line = line.context("stdin の読み取りに失敗")?;
-        if line.is_empty() {
+        if line.trim().is_empty() {
             continue;
         }
-        let (path, text) = match line.split_once('\t') {
-            Some(pt) => pt,
-            None => {
-                writeln!(out, "ERR リクエストは \"<出力wavパス>\\t<テキスト>\" 形式です")?;
-                out.flush()?;
-                continue;
-            }
-        };
-        match synth_one(holder, text, args) {
-            Ok(audio) => match fs::write(path, &audio) {
-                Ok(()) => writeln!(out, "OK {path}")?,
-                Err(e) => writeln!(out, "ERR 書き込み失敗 {path}: {e}")?,
+        let resp = match serde_json::from_str::<ServeRequest>(&line) {
+            Ok(req) => match synth_one(holder, &req.text, args) {
+                Ok(audio) => {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&audio);
+                    serde_json::json!({ "ok": true, "wav_base64": b64 })
+                }
+                Err(e) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }),
             },
-            Err(e) => writeln!(out, "ERR {e:#}")?,
-        }
+            Err(e) => serde_json::json!({ "ok": false, "error": format!("不正なリクエスト JSON: {e}") }),
+        };
+        writeln!(out, "{resp}")?;
         out.flush()?;
     }
     Ok(())
