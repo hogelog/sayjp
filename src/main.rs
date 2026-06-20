@@ -63,7 +63,7 @@ OPTIONS:
                      (EOF で終了)。合成パラメータはすべてリクエストで渡す。
                      リクエスト: {"text":必須, "out"?, "play"?, "style_id"?, "speed"?,
                        "sdp"?, "style_weight"?}  (text 以外は省略時 one-shot と同じ既定値)
-                     応答: {"ok":true,"path":"<書いた wav>"} / {"ok":false,"error":...}
+                     応答: {"status":"ok","path":"<書いた wav>"} / {"status":"error","error":...}
     -h, --help       このヘルプ
 "#;
 
@@ -361,7 +361,7 @@ struct ServeRequest {
 /// 常駐モード。起動時にしたのはモデルロードだけ。あとは stdin から 1 行 = 1 リクエストの
 /// JSON を受け、合成に必要なパラメータはすべてリクエストから取る (起動フラグは見ない)。
 /// 入力: {"text":..., "out"?:..., "play"?:..., "style_id"?:..., "speed"?:..., "sdp"?:..., "style_weight"?:...}
-/// 出力: {"ok":true,"path":"<書いた wav>"} または {"ok":false,"error":"<理由>"}
+/// 出力: {"status":"ok","path":"<書いた wav>"} または {"status":"error","error":"<理由>"}
 /// 1 件の失敗ではループを抜けない (EOF で終了)。
 fn serve(holder: &mut TTSModelHolder) -> Result<()> {
     use std::io::{BufRead, Write};
@@ -375,7 +375,7 @@ fn serve(holder: &mut TTSModelHolder) -> Result<()> {
         }
         let resp = match serde_json::from_str::<ServeRequest>(&line) {
             Ok(req) => serve_one(holder, &req),
-            Err(e) => serde_json::json!({ "ok": false, "error": format!("不正なリクエスト JSON: {e}") }),
+            Err(e) => serde_json::json!({ "status": "error", "error": format!("不正なリクエスト JSON: {e}") }),
         };
         writeln!(out, "{resp}")?;
         out.flush()?;
@@ -395,14 +395,14 @@ fn serve_one(holder: &mut TTSModelHolder, req: &ServeRequest) -> serde_json::Val
         req.style_weight.unwrap_or(DEFAULT_STYLE_WEIGHT),
     ) {
         Ok(a) => a,
-        Err(e) => return serde_json::json!({ "ok": false, "error": format!("{e:#}") }),
+        Err(e) => return serde_json::json!({ "status": "error", "error": format!("{e:#}") }),
     };
     let path = req.out.clone().unwrap_or_else(|| DEFAULT_OUT.to_string());
     if let Err(e) = fs::write(&path, &audio) {
-        return serde_json::json!({ "ok": false, "error": format!("書き込み失敗 {path}: {e}") });
+        return serde_json::json!({ "status": "error", "error": format!("書き込み失敗 {path}: {e}") });
     }
     if req.play.unwrap_or(true) {
         play(Path::new(&path));
     }
-    serde_json::json!({ "ok": true, "path": path })
+    serde_json::json!({ "status": "ok", "path": path })
 }
