@@ -84,11 +84,16 @@ pub fn array_to_vec(audio_array: Array3<f32>) -> Result<Vec<u8>> {
         bits_per_sample: 16,
         sample_format: SampleFormat::Int,
     };
+    // 生 VITS 出力は発話ごとに音量がばらつき mvoice より平均 ~10dB 小さい。SBV2 の
+    // convert_to_16_bit_wav (data / abs(data).max()) と同じく最大振幅でピーク正規化
+    // (0dBFS) して音量を揃える。無音 (peak=0) は割らずにそのまま。
+    let peak = audio_array.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    let scale = if peak > 0.0 { 1.0 / peak } else { 1.0 };
     let mut cursor = Cursor::new(Vec::new());
     let mut writer = WavWriter::new(&mut cursor, spec)?;
     for i in 0..audio_array.shape()[0] {
         for sample in audio_array.slice(s![i, 0, ..]).to_vec() {
-            let v = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+            let v = ((sample * scale).clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
             writer.write_sample(v)?;
         }
     }
